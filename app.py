@@ -87,7 +87,7 @@ with st.sidebar:
 
 
 # --------------------------------------------------
-# 辅助函数：样本解析与全参数蒙特卡洛抽样生成器
+# 辅助函数：样本解析与全参数蒙特卡洛抽样生成器（强化容错防崩版）
 # --------------------------------------------------
 def parse_sample_values(raw_input):
     if isinstance(raw_input, (list, np.ndarray, pd.Series)):
@@ -121,6 +121,10 @@ def generate_variable_distribution(
     valid_samples = samples_arr[samples_arr > 0]
     fit_desc = ""
 
+    # 1. 如果该参数为 0 或未输入有效正值（如油气同层型的储水系数 S），直接返回全 0，杜绝崩溃
+    if len(valid_samples) == 0 and (base_val is None or base_val <= 0.0):
+        return np.zeros(n_sim, dtype=float), 0.0, "未定义或基准为0", np.array([])
+
     if "多井" in mc_mode and len(valid_samples) >= 3:
         mean_val = float(np.mean(valid_samples))
         std_val = float(np.std(valid_samples, ddof=1))
@@ -128,23 +132,49 @@ def generate_variable_distribution(
         chosen = "lognorm" if (dist_type == "对数正态分布 (Lognormal)" or (dist_type == "自动优选" and skewness > 0.3)) else "norm"
 
         if chosen == "lognorm":
-            shape, loc, scale = stats.lognorm.fit(valid_samples, floc=0)
-            draws = stats.lognorm.rvs(shape, loc=loc, scale=scale, size=n_sim)
-            fit_desc = f"对数正态拟合(μ={mean_val:.4f}, σ={std_val:.4f}, n={len(valid_samples)})"
+            try:
+                shape, loc, scale = stats.lognorm.fit(valid_samples, floc=0)
+                draws = stats.lognorm.rvs(shape, loc=loc, scale=scale, size=n_sim)
+                fit_desc = f"对数正态拟合(μ={mean_val:.4f}, σ={std_val:.4f}, n={len(valid_samples)})"
+            except Exception:
+                loc, scale = stats.norm.fit(valid_samples)
+                draws = stats.norm.rvs(loc=loc, scale=scale, size=n_sim)
+                fit_desc = f"正态拟合(μ={mean_val:.4f}, σ={std_val:.4f}, n={len(valid_samples)})"
         else:
             loc, scale = stats.norm.fit(valid_samples)
             draws = stats.norm.rvs(loc=loc, scale=scale, size=n_sim)
             fit_desc = f"正态拟合(μ={mean_val:.4f}, σ={std_val:.4f}, n={len(valid_samples)})"
     else:
-        mean_val = valid_samples[0] if len(valid_samples) > 0 else base_val
-        low = max(clip_range[0], mean_val * (1.0 - err_ratio))
-        high = mean_val * (1.0 + err_ratio)
+        mean_val = valid_samples[0] if len(valid_samples) > 0 else float(base_val)
+        
+        # 防崩核心：严格保证 low <= mean_val <= high 且 low < high
+        raw_low = mean_val * (1.0 - err_ratio)
+        raw_high = mean_val * (1.0 + err_ratio)
+        
+        # 物理截断下限保护
+        low_bound = clip_range[0] if clip_range[0] is not None else 0.0
+        low = max(low_bound, raw_low)
+        high = raw_high
+        
+        # 如果低限被截断导致 low > mean_val，动态拉伸调整
+        if low >= mean_val:
+            low = mean_val * 0.95
+        if high <= mean_val:
+            high = mean_val * 1.05
+        if low >= high:
+            low = mean_val * 0.90
+            high = mean_val * 1.10
+            
         draws = np.random.triangular(low, mean_val, high, n_sim)
         fit_desc = f"先验扰动(基准={mean_val:.4f}, ±{err_ratio*100:.0f}%)"
 
     low_clip = clip_range[0]
     high_clip = clip_range[1]
-    draws = np.clip(draws, low_clip, high_clip) if high_clip is not None else np.clip(draws, low_clip, None)
+    if low_clip is not None:
+        draws = np.maximum(draws, low_clip)
+    if high_clip is not None:
+        draws = np.minimum(draws, high_clip)
+        
     return draws, mean_val, fit_desc, valid_samples
 
 
@@ -166,8 +196,7 @@ with tab_step1:
     st.subheader(f"第一步：构造单元基本信息与静态物性录入 —— 【{active_topic}】")
     st.caption("支持单单元交互录入或下载标准多井/多构造台账模板进行上传，数据将自动流转至下一步。")
 
-    # 提供全新规范的多井综合台账模板
-    col_dl, col_blank = st.columns([2, 2])
+    col_dl, _ = st.columns([2, 2])
     with col_dl:
         sample_well_template = pd.DataFrame([
             {
@@ -194,7 +223,7 @@ with tab_step1:
         st.download_button(
             label="📥 下载更新版多井实测与储量综合台账模板 (CSV)",
             data=buf_t.getvalue(),
-            file_name=f"{active_topic}_更新版深层富钾卤水综合台账模板.csv",
+            file_name=f"{active_topic}_深层富钾卤水综合台账模板.csv",
             mime="text/csv",
         )
 
@@ -242,7 +271,7 @@ with tab_step1:
                 u_top = st.number_input("平均储层顶面标高 H (m)", value=-2250.0, step=50.0)
             u_sw, u_bw = 0.0, 1.0
 
-        st.caption("💡 若有该构造带多口井的孔隙度或品位实测序列，可在此粘贴（选填，用于后续拟合）：")
+        st.caption("💡 若有该构造带多口井的孔隙度或品位实测序列，可在此粘贴（选填）：")
         m_col1, m_col2 = st.columns(2)
         with m_col1:
             u_phi_str = st.text_input("多井孔隙度序列（逗号分隔）", value="0.065, 0.082, 0.071, 0.095, 0.078, 0.088")
@@ -260,7 +289,7 @@ with tab_step1:
                 "多井孔隙度序列": u_phi_str,
                 "多井品位序列": u_c_str,
             }
-            st.success(f"已暂存【{u_name}】静态参数！请点击上方切换至「2️⃣ 全参数蒙特卡洛模拟」。")
+            st.success(f"已暂存【{u_name}】静态参数！请点击上方标签切换至「2️⃣ 全参数蒙特卡洛模拟」。")
 
     else:
         file_up = st.file_uploader("上传规范台账文件", type=["csv", "xlsx", "xls"])
@@ -297,7 +326,7 @@ with tab_step1:
                         "多井孔隙度序列": ", ".join([str(v) for v in df_up["有效孔隙度(%)"].dropna().values]) if "有效孔隙度(%)" in df_up.columns else "",
                         "多井品位序列": ", ".join([str(v) for v in df_up["KCl品位(t/m3)"].dropna().values]) if "KCl品位(t/m3)" in df_up.columns else "",
                     }
-                    st.success("已成功从表格中流转参数！请前往下一步。")
+                    st.success("已成功从表格中流转参数！请前往第二步。")
             except Exception as e:
                 st.error(f"解析出错: {e}")
 
@@ -336,7 +365,7 @@ with tab_step2:
             c_arr = parse_sample_values(p_data.get("多井品位序列", ""))
 
             A_m2 = p_data["A"] * 1e6
-            h_val = p_data["h"]
+            h_val = p_data["h"] if p_data.get("h") is not None else 25.0
 
             phi_draws, phi_mean, phi_desc, phi_raw_valid = generate_variable_distribution(
                 mc_mode, phi_arr, p_data["phi"], err_phi, dist_type, n_sim, (0.001, 0.45)
@@ -350,12 +379,21 @@ with tab_step2:
             h_draws, h_mean, _, _ = generate_variable_distribution(
                 "单点/少井先验扰动模式", np.array([]), h_val, err_h, "三角分布", n_sim, (1.0, 500.0)
             )
+            
+            # Sw 与 S 容错保护抽样
+            sw_base_val = float(p_data.get("Sw", 0.65))
             Sw_draws, Sw_mean, _, _ = generate_variable_distribution(
-                "单点/少井先验扰动模式", np.array([]), p_data["Sw"], err_Sw, "三角分布", n_sim, (0.05, 1.0)
+                "单点/少井先验扰动模式", np.array([]), sw_base_val, err_Sw, "三角分布", n_sim, (0.05, 1.0)
             )
-            S_draws, S_mean, _, _ = generate_variable_distribution(
-                "单点/少井先验扰动模式", np.array([]), p_data["S"], err_S, "三角分布", n_sim, (1e-6, 0.1)
-            )
+            
+            # 储水系数 S：若为油气同层型则无需抽样，赋 0
+            if "非油气" in p_data["储层类型"]:
+                s_base_val = float(p_data.get("S", 0.0005))
+                S_draws, S_mean, _, _ = generate_variable_distribution(
+                    "单点/少井先验扰动模式", np.array([]), s_base_val, err_S, "三角分布", n_sim, (1e-6, 0.1)
+                )
+            else:
+                S_draws, S_mean = np.zeros(n_sim, dtype=float), 0.0
 
             # 暂存抽样数据至 session
             st.session_state.pipeline_data.update({
@@ -367,7 +405,7 @@ with tab_step2:
                 "Sw_draws": Sw_draws, "Sw_mean": Sw_mean,
                 "S_draws": S_draws, "S_mean": S_mean,
             })
-            st.success("蒙特卡洛抽样已完成！请查看下方拟合分布，随后进入「3️⃣ 多物理场动态校准」。")
+            st.success("蒙特卡洛抽样已安全完成！请查看下方拟合分布，随后进入「3️⃣ 多物理场动态校准」。")
 
         if "phi_draws" in st.session_state.pipeline_data:
             draw_data = st.session_state.pipeline_data
@@ -459,7 +497,7 @@ with tab_step3:
                 calib_factor = np.clip(1.0 - (in_dp_flow / (in_dp_flow + 5.0)) * 0.15, 0.80, 1.15)
                 dyn_applied = "两相渗流产能校准可动水饱和度 Sw"
                 dyn_process = f"剔除束缚水影响；校准系数={calib_factor:.3f}"
-            elif "校准弹性储水系数" in calib_choice:
+            elif "校准弹性储水系数" in calib_choice and "非油气" in p_data["储层类型"]:
                 S_cal = in_wp / (in_dp * 100.0 * p_data["A_mean"] + 1e-6)
                 calib_factor = np.clip(S_cal / (p_data["S_mean"] + 1e-6), 0.65, 1.35)
                 dyn_applied = "承压扬程释水校准储水系数 S"
@@ -478,7 +516,7 @@ with tab_step3:
             Sw_f_mean = p_data["Sw_mean"] * (calib_factor if "含水饱和度" in calib_choice else 1.0)
             S_f_mean = p_data["S_mean"] * (calib_factor if "储水系数" in calib_choice else 1.0)
 
-            elastic_head = max(0.0, p_data["承压水头标高"] - p_data["储层顶面标高"])
+            elastic_head = max(0.0, p_data.get("承压水头标高", 340.0) - p_data.get("储层顶面标高", -2250.0))
 
             if "非油气" in p_data["储层类型"]:
                 V_f_draws = V_base if p_data.get("V") is not None else (A_f_draws * h_f_draws)
@@ -501,7 +539,10 @@ with tab_step3:
             P_mean = Q_mean * p_data["c_mean"]
 
             # 纯静态基准
-            P_static_base = ((V_base * p_data["phi_mean"] * p_data["Sw_mean"]) / p_data.get("Bw", 1.02)) * p_data["c_mean"] if "非油气" not in p_data["储层类型"] else ((p_data["phi_mean"] * V_base) + (p_data["S_mean"] * elastic_head * p_data["A_mean"])) * p_data["c_mean"]
+            if "非油气" not in p_data["储层类型"]:
+                P_static_base = ((V_base * p_data["phi_mean"] * p_data["Sw_mean"]) / p_data.get("Bw", 1.02)) * p_data["c_mean"]
+            else:
+                P_static_base = ((p_data["phi_mean"] * V_base) + (p_data["S_mean"] * elastic_head * p_data["A_mean"])) * p_data["c_mean"]
 
             res_record = {
                 "计算单元编号": f"UNIT-{uuid.uuid4().hex[:8].upper()}",
@@ -538,7 +579,7 @@ with tab_step3:
 with tab_step4:
     st.subheader(f"第四步：【{active_topic}】综合成果核定与全要素总账归档")
 
-    if st.session_state.temp_single_record is not None:
+    if st.session_state.get("temp_single_record") is not None:
         rec = st.session_state.temp_single_record
         arts = st.session_state.temp_mc_artifacts
         st.markdown(f"#### 构造单元即时核定看板：{rec['构造带/单元名称']}")
