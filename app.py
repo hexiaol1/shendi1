@@ -93,8 +93,8 @@ with st.sidebar:
 # 辅助函数：多井离散样本解析与自适应抽样
 # --------------------------------------------------
 def parse_sample_values(raw_input):
-    """解析以逗号、空格或换行分隔的多个测试样本序列"""
-    if isinstance(raw_input, (list, np.ndarray)):
+    """解析以逗号、空格或换行分隔的测试样本序列"""
+    if isinstance(raw_input, (list, np.ndarray, pd.Series)):
         arr = np.array(raw_input, dtype=float)
         return arr[~np.isnan(arr)]
     if pd.isna(raw_input):
@@ -109,6 +109,31 @@ def parse_sample_values(raw_input):
         except ValueError:
             continue
     return np.array(vals, dtype=float)
+
+
+def extract_samples_from_file(uploaded_file):
+    """从上传的多井单项台账中自动匹配提取孔隙度和品位序列"""
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+        
+        phi_cols = [c for c in df.columns if any(k in str(c).lower() for k in ["por", "phi", "孔隙度", "孔隙率"])]
+        c_cols = [c for c in df.columns if any(k in str(c).lower() for k in ["kcl", "品位", "浓度", "grade"])]
+        
+        phi_samples = df[phi_cols[0]].dropna().values if phi_cols else np.array([])
+        c_samples = df[c_cols[0]].dropna().values if c_cols else np.array([])
+        
+        # 兼容百分比与小数
+        phi_arr = np.array(phi_samples, dtype=float)
+        if len(phi_arr) > 0 and np.mean(phi_arr) > 1.0:
+            phi_arr = phi_arr / 100.0
+            
+        c_arr = np.array(c_samples, dtype=float)
+        return phi_arr, c_arr, df
+    except Exception as e:
+        return np.array([]), np.array([]), None
 
 
 def generate_parameter_draws(
@@ -231,7 +256,7 @@ def evaluate_and_archive_unit(
     top_H = float(r.get("储层顶面标高", r.get("H_top", -2200.0)))
     elastic_head = max(0.0, head_h - top_H)
 
-    # 2. 蒙特卡洛变量抽样
+    # 2. 蒙特卡洛抽样
     phi_draws, phi_fit = generate_parameter_draws(
         mc_mode=mc_mode, samples_arr=phi_sample_arr, base_val=phi_single,
         err_ratio=phi_err_manual, dist_type=dist_type, n_sim=n_sim, val_type="phi"
@@ -244,7 +269,7 @@ def evaluate_and_archive_unit(
     phi_mean = phi_fit["mean"]
     c_mean = c_fit["mean"]
 
-    # 3. 静态容积法基准推演
+    # 3. 静态容积法基准
     if "非油气" in res_type:
         calc_model = "非油气同层型"
         Q_static_raw = (phi_mean * V_m3) + (S_init * elastic_head * A_m2)
@@ -253,7 +278,7 @@ def evaluate_and_archive_unit(
         Q_static_raw = (V_m3 * phi_mean * Sw_init) / Bw_init if has_seismic_vol else (A_m2 * h_init * phi_mean * Sw_init) / Bw_init
     P_static_raw = Q_static_raw * c_mean
 
-    # 4. 动态约束：校准静态参数到合理流动取值
+    # 4. 动态约束校准
     dyn_choice = str(r.get("动态方法", default_dyn_method))
     dyn_method_applied = "纯静态（未启用动态数据校准）"
     dyn_process = "未录入动态试采数据，沿用静态解释基准"
@@ -330,7 +355,6 @@ def evaluate_and_archive_unit(
     p50_val = round(float(np.percentile(P_draws_kcl_wan, 50)), 2)
     p10_val = round(float(np.percentile(P_draws_kcl_wan, 90)), 2)
 
-    # 规范化归档字典，确保所有键完整统一
     record = {
         "计算单元编号": unit_id,
         "计算时间": calc_time,
@@ -384,7 +408,7 @@ tab_step1, tab_archive, tab_docs = st.tabs([
 with tab_step1:
     st.subheader(f"第一步：计算单元参数推演 —— 【{active_topic}】")
     st.markdown(
-        "**自适应建模支持**：针对井数多、资料全的成熟区提供**多井概率密度统计拟合**；针对勘探早期、井数少或仅有单点解释的区域提供**先验扰动模式**。"
+        "**自适应建模支持**：针对井数多、资料全的成熟区提供**多井概率密度统计拟合**（支持直接粘贴数值或上传独立多井测井台账文件）；针对勘探早期、井数少或仅有单点解释的区域提供**先验扰动模式**。"
     )
 
     with st.expander("⚙️ 蒙特卡洛建模模式与不确定性参数配置（点击展开/收起）", expanded=True):
@@ -396,7 +420,7 @@ with tab_step1:
                     "模式一：多井实测样本统计拟合模式 (适用于资料丰富/井数≥3的成熟区)",
                     "模式二：单点/少井先验扰动模式 (适用于探井少/仅1~2口井或单点均值区)",
                 ],
-                index=1
+                index=0
             )
         with col_m2:
             global_n_sim = st.select_slider(
@@ -406,7 +430,7 @@ with tab_step1:
             )
 
         if "模式一" in global_mc_mode:
-            st.info("💡 **模式一启用中**：系统将自动读取多井样本序列，拟合正态/对数正态连续概率密度分布。")
+            st.info("💡 **模式一启用中**：系统支持直接上传多井台账表格，自动拟合对数正态或正态概率密度分布。")
             global_dist_choice = st.selectbox(
                 "概率分布拟合函数优选：",
                 ["自动优选 (根据样本偏度自动判别)", "对数正态分布 (Lognormal - 推荐孔隙度)", "正态分布 (Normal)"]
@@ -425,7 +449,7 @@ with tab_step1:
 
     input_channel = st.radio(
         "请选择录入通道：",
-        ["方式 A：在线交互录入参数（推荐单单元核算）", "方式 B：批量上传多构造带数据表格 (CSV / Excel)"],
+        ["方式 A：在线交互录入参数（推荐单单元核算）", "方式 B：批量上传多构造带汇总数据表 (CSV / Excel)"],
         horizontal=True
     )
 
@@ -447,24 +471,57 @@ with tab_step1:
 
         st.markdown("#### 2. 物性与几何参数录入")
         if "模式一" in global_mc_mode:
-            st.caption("🔍 **多井样本录入**：请输入该构造带多口井实测离散样本（数值用逗号或空格隔开）：")
-            ib1, ib2 = st.columns(2)
-            with ib1:
-                u_phi_str = st.text_area(
-                    "多井有效孔隙度序列 ϕ (如: 0.065, 0.082, 0.071, 0.095, 0.078, 0.088)",
-                    value="0.065, 0.082, 0.071, 0.095, 0.078, 0.088",
-                    height=70
-                )
-                u_phi_single = 0.08
-            with ib2:
-                u_c_str = st.text_area(
-                    "多井 KCl 品位序列 C (t/m³，如: 0.0175, 0.0192, 0.0210, 0.0185)",
-                    value="0.0175, 0.0192, 0.0210, 0.0185",
-                    height=70
-                )
-                u_c_single = 0.0185
+            st.caption("🔍 **模式一：多井样本获取方式**（支持直接粘贴文本或上传单井测井解释台账文件）：")
+            mc_input_type = st.radio("选择多井数据来源：", ["上传本构造带多井实测台账文件 (Excel/CSV)", "手动文本框粘贴序列"], horizontal=True)
+
+            u_phi_str = ""
+            u_c_str = ""
+            u_phi_single = 0.08
+            u_c_single = 0.0185
+
+            if "上传" in mc_input_type:
+                col_dl_well, col_up_well = st.columns([1, 3])
+                with col_dl_well:
+                    # 示例文件下载
+                    well_sample_df = pd.DataFrame({
+                        "井号": ["Well-1", "Well-2", "Well-3", "Well-4", "Well-5", "Well-6"],
+                        "测试层段": ["T3l-1", "T3l-1", "T3l-2", "T3l-1", "T3l-2", "T3l-1"],
+                        "有效孔隙度(%)": [6.8, 8.2, 7.5, 9.4, 7.9, 8.6],
+                        "KCl品位(t/m3)": [0.0182, 0.0195, 0.0210, 0.0178, 0.0190, 0.0205]
+                    })
+                    w_buf = io.BytesIO()
+                    well_sample_df.to_csv(w_buf, index=False, encoding="utf_8_sig")
+                    st.download_button(
+                        label="📥 下载多井台账模板 (CSV)",
+                        data=w_buf.getvalue(),
+                        file_name=f"{active_topic}_多井实测台账模板.csv",
+                        mime="text/csv",
+                    )
+                with col_up_well:
+                    well_file = st.file_uploader("上传多井台账文件 (包含孔隙度与品位列)", type=["csv", "xlsx", "xls"], key="well_table_up")
+                    if well_file is not None:
+                        f_phi, f_c, df_well_preview = extract_samples_from_file(well_file)
+                        if df_well_preview is not None:
+                            st.success(f"已成功识别文件！读取到 {len(f_phi)} 个孔隙度样本，{len(f_c)} 个品位样本。")
+                            st.dataframe(df_well_preview.head(4), use_container_width=True)
+                            u_phi_str = ", ".join([str(v) for v in f_phi])
+                            u_c_str = ", ".join([str(v) for v in f_c])
+            else:
+                ib1, ib2 = st.columns(2)
+                with ib1:
+                    u_phi_str = st.text_area(
+                        "多井有效孔隙度序列 ϕ (如: 0.065, 0.082, 0.071, 0.095, 0.078, 0.088)",
+                        value="0.065, 0.082, 0.071, 0.095, 0.078, 0.088",
+                        height=70
+                    )
+                with ib2:
+                    u_c_str = st.text_area(
+                        "多井 KCl 品位序列 C (t/m³，如: 0.0175, 0.0192, 0.0210, 0.0185)",
+                        value="0.0175, 0.0192, 0.0210, 0.0185",
+                        height=70
+                    )
         else:
-            st.caption("🔍 **单点/少井参数录入**：井数较少时，直接输入单井解释代表值：")
+            st.caption("🔍 **模式二：单点/少井参数录入**：井数较少时，直接输入单井解释代表值：")
             ib3, ib4 = st.columns(2)
             with ib3:
                 u_phi_single = st.number_input("储层平均有效孔隙度 ϕ (小数)", value=0.078, step=0.005, format="%.3f")
@@ -690,7 +747,6 @@ with tab_archive:
         df_arc = pd.DataFrame(my_records)
         st.write(f"已累计归档 **{len(df_arc)}** 个单元的具体推演履历。")
 
-        # 预设的核心展示列清单
         preferred_cols = [
             "计算单元编号", "计算时间", "构造带/单元名称", "储层类型", "计算模型",
             "蒙特卡洛模式", "孔隙度分布特征", "动态参数校准说明",
@@ -698,14 +754,12 @@ with tab_archive:
             "校准后容积法推演"
         ]
         
-        # 安全取交集，杜绝任何 KeyError 报错
         valid_cols = [col for col in preferred_cols if col in df_arc.columns]
         if not valid_cols:
             valid_cols = list(df_arc.columns)
             
         st.dataframe(df_arc[valid_cols], use_container_width=True)
 
-        # 绘制柱状图（带列存在性安全防守）
         x_col = "构造带/单元名称" if "构造带/单元名称" in df_arc.columns else df_arc.columns[0]
         y_col = "最终核定KCl储量(万吨)" if "最终核定KCl储量(万吨)" in df_arc.columns else df_arc.columns[1]
         color_col = "动静结合方法" if "动静结合方法" in df_arc.columns else None
@@ -721,7 +775,6 @@ with tab_archive:
         fig_unit_bar.update_traces(textposition="outside")
         st.plotly_chart(fig_unit_bar, use_container_width=True)
 
-        # 导出全部字段
         csv_archive_out = df_arc.to_csv(index=False).encode("utf_8_sig")
         st.download_button(
             label=f"📥 导出【{active_topic}】全要素归档报表 (CSV)",
@@ -739,9 +792,9 @@ with tab_docs:
     st.markdown("### 1. 蒙特卡洛建模双模式设计准则")
     st.markdown("""
     - **模式一：多井实测样本拟合（成熟探区）**
-      当同一构造带具备 3 口或以上钻井资料时，系统采用地质统计学理论，自动拟合**对数正态分布 (Lognormal)** 或 **正态分布 (Normal)**。抽样直接反映了地质非均质性的离散特征。
+      当同一构造带具备 3 口或以上钻井资料时，系统采用地质统计学理论，自动拟合**对数正态分布 (Lognormal)** 或 **正态分布 (Normal)**。支持上传专属的多井测井解释台账表。
     - **模式二：单点/少井先验扰动（早期新区/少井区）**
-      对于仅有 1~2 口井甚至区域类比参数的单元，系统允许用户输入单点均值，并通过先验三角分布与自定义相对误差（如 \(\pm 20\%\)）实现不确定性量化，既不违背地质实际，又能保障输出规范的 P90/P50/P10 区间。
+      对于仅有 1~2 口井甚至区域类比参数的单元，系统允许用户输入单点均值，并通过先验三角分布与自定义相对误差（如 \(\pm 20\%\)）实现不确定性量化。
     """)
 
     st.markdown("### 2. 动-静结合参数校准机理")
