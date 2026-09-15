@@ -34,6 +34,12 @@ if "topic_archives" not in st.session_state:
         "川南专题": [],
     }
 
+# 缓存当前正在核算的单单元结果，解决 Streamlit 按钮嵌套重跑丢失状态问题
+if "temp_single_record" not in st.session_state:
+    st.session_state.temp_single_record = None
+if "temp_mc_samples" not in st.session_state:
+    st.session_state.temp_mc_samples = None
+
 # --------------------------------------------------
 # 侧边栏：免密切换与独立进度监控
 # --------------------------------------------------
@@ -77,6 +83,8 @@ with st.sidebar:
 
     if st.button("🗑️ 清空本专题归档记录", use_container_width=True):
         st.session_state.topic_archives[active_topic] = []
+        st.session_state.temp_single_record = None
+        st.session_state.temp_mc_samples = None
         st.rerun()
 
 
@@ -302,7 +310,7 @@ tab_step1, tab_archive, tab_docs = st.tabs([
 ])
 
 # --------------------------------------------------
-# TAB 1: 第一步（双通道：参数输入 + 表格上传；蒙特卡洛可调）
+# TAB 1: 第一步
 # --------------------------------------------------
 with tab_step1:
     st.subheader(f"第一步：计算单元参数录入与动静结合推演 —— 【{active_topic}】")
@@ -310,7 +318,7 @@ with tab_step1:
         "支持在线手动输入具体参数，或直接批量上传已有表格。无论哪种方式，均支持自由调节蒙特卡洛随机不确定性参数。"
     )
 
-    # 1. 全局可调节蒙特卡洛控制面板
+    # 1. 蒙特卡洛全局参数控制面板
     with st.expander("⚙️ 蒙特卡洛模拟控制与不确定性扰动参数调节（点击展开/收起）", expanded=True):
         mc_col1, mc_col2, mc_col3, mc_col4 = st.columns(4)
         with mc_col1:
@@ -318,25 +326,21 @@ with tab_step1:
                 "抽样模拟试验次数 (N)",
                 options=[1000, 2000, 5000, 10000, 20000, 50000],
                 value=5000,
-                help="模拟次数越大，P10/P50/P90 估计越平滑稳定"
             )
         with mc_col2:
             mc_phi_err = st.slider(
                 "有效孔隙度 ϕ 相对扰动幅度 (±%)",
                 min_value=5, max_value=50, value=20, step=5,
-                help="基于三角分布的左右边界变异率"
             ) / 100.0
         with mc_col3:
             mc_c_err = st.slider(
                 "KCl 品位 C 相对扰动幅度 (±%)",
                 min_value=5, max_value=50, value=15, step=5,
-                help="基于地球化学分析品位的相对变异率"
             ) / 100.0
         with mc_col4:
             mc_extra_err = st.slider(
                 "饱和度 Sw / 储水系数 S 相对变异 (±%)",
                 min_value=5, max_value=30, value=10, step=1,
-                help="次要物性参数的正态/三角随机扰动系数"
             ) / 100.0
 
     cur_mc_params = {
@@ -349,7 +353,6 @@ with tab_step1:
 
     st.markdown("---")
 
-    # 2. 数据录入方式切换（双通道）
     input_mode = st.radio(
         "请选择当前录入通道：",
         ["方式 A：在线交互录入计算单元具体参数（单单元高精度推演）", "方式 B：批量上传多计算单元数据表格 (CSV / Excel)"],
@@ -406,7 +409,7 @@ with tab_step1:
                 u_top = st.number_input("平均储层顶面标高 H (m)", value=-2250.0, step=50.0)
             u_sw, u_bw = None, None
 
-        st.markdown("#### 3. 动态试采约束参数（可选，未填则自动平滑退化为静态）")
+        st.markdown("#### 3. 动态试采约束参数（可选）")
         enable_dyn_single = st.checkbox("输入动态试采参数进行动静结合校准", value=True)
         u_wp, u_dp, u_ct = None, None, None
         u_qw, u_dp_flow, u_k, u_mu, u_re = None, None, None, None, None
@@ -431,6 +434,7 @@ with tab_step1:
                 with id7:
                     u_mu = st.number_input("卤水动力黏度 μ (mPa·s)", value=1.12, step=0.05)
 
+        # 触发计算按钮：计算后直接存入 session_state
         if st.button("🚀 执行推演计算与蒙特卡洛模拟", type="primary"):
             input_dict = {
                 "构造带": u_name,
@@ -451,39 +455,57 @@ with tab_step1:
                 run_mc=True,
                 mc_params=cur_mc_params,
             )
+            # 存入临时缓存，避免重跑丢失
+            st.session_state.temp_single_record = single_rec
+            st.session_state.temp_mc_samples = mc_samples
 
-            st.success(f"计算完成！生成计算单元编号：{single_rec['计算单元编号']}")
+        # 只要存在计算结果，就渲染展示区与存入按钮（彻底解耦嵌套）
+        if st.session_state.temp_single_record is not None:
+            cur_rec = st.session_state.temp_single_record
+            cur_samples = st.session_state.temp_mc_samples
+
+            st.markdown("---")
+            st.subheader(f"📊 当前推演计算结果：{cur_rec['构造带/单元名称']}")
 
             res_c1, res_c2, res_c3, res_c4 = st.columns(4)
-            res_c1.metric("建模模式", single_rec["几何建模方式"])
-            res_c2.metric("动静连通系数 α", f"{single_rec['动静有效性系数(α)']:.4f}")
-            res_c3.metric("静态 KCl 储量", f"{single_rec['静态KCl储量(万吨)']:,.2f} 万吨")
-            res_c4.metric("最终核定 KCl 储量", f"{single_rec['最终核定KCl储量(万吨)']:,.2f} 万吨")
+            res_c1.metric("建模模式", cur_rec["几何建模方式"])
+            res_c2.metric("动静连通系数 α", f"{cur_rec['动静有效性系数(α)']:.4f}")
+            res_c3.metric("静态 KCl 储量", f"{cur_rec['静态KCl储量(万吨)']:,.2f} 万吨")
+            res_c4.metric("最终核定 KCl 储量", f"{cur_rec['最终核定KCl储量(万吨)']:,.2f} 万吨")
 
             with st.expander("🔍 查看本单元推导过程细节", expanded=True):
-                st.write(f"**容积法推导**：{single_rec['容积法公式推导过程']}")
-                st.write(f"**动静约束推导**：{single_rec['动静结合推导过程及参数']}")
+                st.write(f"**容积法推导**：{cur_rec['容积法公式推导过程']}")
+                st.write(f"**动静约束推导**：{cur_rec['动静结合推导过程及参数']}")
                 st.write(
-                    f"**蒙特卡洛 ({cur_mc_params['n_sim']}次) 不确定性区间**："
-                    f"保守值(P90) = **{single_rec['蒙特卡洛P90(万吨)']}** 万吨 | "
-                    f"中值(P50) = **{single_rec['蒙特卡洛P50(万吨)']}** 万吨 | "
-                    f"乐观值(P10) = **{single_rec['蒙特卡洛P10(万吨)']}** 万吨"
+                    f"**蒙特卡洛 ({cur_rec['蒙特卡洛模拟次数']}次) 不确定性区间**："
+                    f"保守值(P90) = **{cur_rec['蒙特卡洛P90(万吨)']}** 万吨 | "
+                    f"中值(P50) = **{cur_rec['蒙特卡洛P50(万吨)']}** 万吨 | "
+                    f"乐观值(P10) = **{cur_rec['蒙特卡洛P10(万吨)']}** 万吨"
                 )
 
-            if mc_samples is not None:
+            if cur_samples is not None:
                 fig_hist = px.histogram(
-                    x=mc_samples, nbins=60,
+                    x=cur_samples, nbins=60,
                     labels={"x": "KCl 储量 (万吨)"},
-                    title=f"{u_name} - 蒙特卡洛概率分布 (P10 - P50 - P90)",
+                    title=f"{cur_rec['构造带/单元名称']} - 蒙特卡洛概率分布 (P10 - P50 - P90)",
                 )
-                fig_hist.add_vline(x=single_rec["蒙特卡洛P90(万吨)"], line_dash="dash", line_color="orange", annotation_text="P90")
-                fig_hist.add_vline(x=single_rec["蒙特卡洛P50(万吨)"], line_dash="solid", line_color="green", annotation_text="P50")
-                fig_hist.add_vline(x=single_rec["蒙特卡洛P10(万吨)"], line_dash="dash", line_color="red", annotation_text="P10")
+                fig_hist.add_vline(x=cur_rec["蒙特卡洛P90(万吨)"], line_dash="dash", line_color="orange", annotation_text="P90")
+                fig_hist.add_vline(x=cur_rec["蒙特卡洛P50(万吨)"], line_dash="solid", line_color="green", annotation_text="P50")
+                fig_hist.add_vline(x=cur_rec["蒙特卡洛P10(万吨)"], line_dash="dash", line_color="red", annotation_text="P10")
                 st.plotly_chart(fig_hist, use_container_width=True)
 
-            if st.button("💾 将本计算单元结果存入总账"):
-                st.session_state.topic_archives[active_topic].append(single_rec)
-                st.success("已成功归档！可切换至第二步 Tab 查阅与导出。")
+            # 存入总账按钮：置于顶层，无嵌套，点击即生效并刷新
+            col_save1, col_save2 = st.columns([1, 3])
+            with col_save1:
+                if st.button("💾 将本计算单元结果存入总账", type="primary", use_container_width=True):
+                    # 避免重复存入相同编号
+                    existing_ids = [item["计算单元编号"] for item in st.session_state.topic_archives[active_topic]]
+                    if cur_rec["计算单元编号"] not in existing_ids:
+                        st.session_state.topic_archives[active_topic].append(cur_rec)
+                    st.success(f"已成功归档至【{active_topic}】总账！")
+                    st.session_state.temp_single_record = None
+                    st.session_state.temp_mc_samples = None
+                    st.rerun()
 
     else:
         # 方式 B：批量上传表格
@@ -547,13 +569,9 @@ with tab_step1:
                         st.session_state.topic_archives[active_topic].append(rec)
 
                     st.success(
-                        f"批量核算完成！已成功将 {len(batch_records)} 个单元按当前蒙特卡洛参数推演并归档！"
+                        f"批量核算完成！已成功将 {len(batch_records)} 个单元写入【{active_topic}】总账！"
                     )
-                    df_b_show = pd.DataFrame(batch_records)[[
-                        "计算单元编号", "构造带/单元名称", "储层类型", "几何建模方式",
-                        "动静结合方法", "动静有效性系数(α)", "最终核定KCl储量(万吨)", "蒙特卡洛P50(万吨)"
-                    ]]
-                    st.dataframe(df_b_show, use_container_width=True)
+                    st.rerun()
             except Exception as err:
                 st.error(f"批量推演失败: {str(err)}")
 
