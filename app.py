@@ -3,457 +3,350 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import io
 
 # --------------------------------------------------
-# 1. 页面全局配置与主题样式
+# 全局页面配置
 # --------------------------------------------------
 st.set_page_config(
-    page_title="深层卤水钾盐动-静综合资源评价系统",
+    page_title="深层卤水钾盐动-静综合资源评价自适应系统",
     page_icon="🧂",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 自定义 CSS 提升专业视觉效果
-st.markdown("""
-<style>
-    .block-container { padding-top: 1.5rem; padding-bottom: 2.5rem; }
-    .stMetric { background-color: #f8f9fa; border-radius: 8px; padding: 12px; border-left: 4px solid #1f77b4; }
-    .status-badge { font-weight: bold; padding: 3px 8px; border-radius: 4px; }
-</style>
-""", unsafe_allow_html=True)
+TARGET_KCL_TONS = 50_000_000.0  # 全盆地新增 5000 万吨目标
+
+if "stored_evaluations" not in st.session_state:
+    st.session_state.stored_evaluations = []
 
 # --------------------------------------------------
-# 2. 会话状态初始化 (用于跨构造带协同存储)
+# 核心自适应计算引擎
 # --------------------------------------------------
-if "zones_data" not in st.session_state:
-    st.session_state.zones_data = []
+def evaluate_brine_record(row_data, run_mc=True, n_sim=5000):
+    """
+    根据行数据中提供的有效字段，自适应决策计算链路：
+    容积法(油气同层/非油气同层) -> 蒙特卡洛不确定性模拟 -> 动态压降约束
+    """
+    res = {}
+    r = {k.strip(): v for k, v in row_data.items() if pd.notna(v)}
+    
+    res["构造带"] = str(r.get("构造带", r.get("构造名称", "未命名构造")))
+    res["区块"] = str(r.get("区块", r.get("专题", "川中专题")))
+    res["储层类型"] = str(r.get("储层类型", r.get("类型", "油气同层型"))).strip()
+    
+    # 基础参数提取 (带默认单位换算与容错)
+    # 品位 C (t/m3)
+    C = float(r.get("C", r.get("KCl品位", r.get("品位", 0.018))))
+    res["KCl品位(t/m³)"] = C
+    
+    # 面积 A (km2 -> m2)
+    A_km2 = float(r.get("A", r.get("Aw", r.get("面积", 0.0))))
+    A_m2 = A_km2 * 1e6
+    
+    # 厚度 h (m)
+    h = float(r.get("h", r.get("厚度", r.get("有效厚度", 0.0))))
+    
+    # 孔隙度 phi (支持百分数或小数输入)
+    phi = float(r.get("phi", r.get("ϕ", r.get("孔隙度", r.get("孔隙率", 0.08)))))
+    if phi > 1.0:
+        phi = phi / 100.0
+        
+    # 判断是否具备地震精细雕刻体积 V (10^6 m3)
+    has_seismic_vol = ("V" in r) or ("雕刻体积" in r) or ("储层体积" in r)
+    if has_seismic_vol:
+        V_raw = float(r.get("V", r.get("雕刻体积", r.get("储层体积", 0.0))))
+        # 兼容单位：如果输入值 < 10000，通常用户是以 百万方(10^6 m3) 录入
+        V_m3 = V_raw * 1e6 if V_raw < 1e5 else V_raw
+        res["几何建模方式"] = "地震精细三维雕刻体积 V"
+    else:
+        V_m3 = A_m2 * h
+        res["几何建模方式"] = "面积×厚度估算 (A×h)"
 
-# 全盆地增储目标：5000 万吨 KCl (以吨为单位存储)
-TARGET_KCL_TONS = 50_000_000.0
+    # 1. 容积法基准计算
+    if "非油气" in res["储层类型"]:
+        res["计算模型"] = "非油气同层型"
+        S = float(r.get("S", r.get("弹性储水系数", 0.0005)))
+        head_h = float(r.get("承压水头标高", r.get("h_head", 350.0)))
+        top_H = float(r.get("储层顶面标高", r.get("H_top", -2200.0)))
+        elastic_head = max(0.0, head_h - top_H)
+        
+        # 公式: Q = phi * V + S * (h - H) * A
+        Q_static = (phi * V_m3) + (S * elastic_head * A_m2)
+    else:
+        res["计算模型"] = "油气同层型"
+        Sw = float(r.get("Sw", r.get("含水饱和度", 0.65)))
+        if Sw > 1.0: Sw /= 100.0
+        Bw = float(r.get("Bw", r.get("体积系数", 1.02)))
+        
+        # 公式: Q = (A * h * phi * Sw) / Bw
+        if has_seismic_vol:
+            Q_static = (V_m3 * phi * Sw) / Bw
+        else:
+            Q_static = (A_m2 * h * phi * Sw) / Bw
+            
+    P_static = Q_static * C
+    res["静态卤水体积(亿m³)"] = round(Q_static / 1e8, 4)
+    res["静态KCl储量(万吨)"] = round(P_static / 1e4, 2)
+    
+    # 2. 动态参数感知与校准计算
+    has_dynamic = ("Wp" in r or "排卤量" in r or "累计产水量" in r) and ("dp" in r or "压降" in r or "Δp" in r)
+    if has_dynamic:
+        Wp = float(r.get("Wp", r.get("排卤量", r.get("累计产水量", 0.0))))
+        dp = float(r.get("dp", r.get("压降", r.get("Δp", 1.0))))
+        ct_raw = float(r.get("ct", r.get("Ct", r.get("压缩系数", 8.5))))
+        ct = ct_raw * 1e-4 if ct_raw > 1e-2 else ct_raw  # 兼容量纲
+        
+        if dp > 0 and ct > 0:
+            Q_dynamic = Wp / (ct * dp)
+            alpha = min(1.0, max(0.05, Q_dynamic / Q_static)) if Q_static > 0 else 1.0
+            res["动态约束状态"] = f"已约束 (动静连通比 α={alpha:.3f})"
+            Q_constrained = Q_static * alpha
+            P_constrained = P_static * alpha
+        else:
+            res["动态约束状态"] = "数据异常未启用"
+            Q_constrained = Q_static
+            P_constrained = P_static
+            alpha = 1.0
+    else:
+        res["动态约束状态"] = "无动态数据(使用纯静态)"
+        Q_constrained = Q_static
+        P_constrained = P_static
+        alpha = 1.0
+        
+    res["最终核定卤水体积(亿m³)"] = round(Q_constrained / 1e8, 4)
+    res["最终核定KCl储量(万吨)"] = round(P_constrained / 1e4, 2)
+    res["P_final_raw"] = P_constrained
+
+    # 3. 蒙特卡洛模拟 (根据可用波动字段或默认自适应波动)
+    mc_results = {}
+    if run_mc:
+        np.random.seed(42)
+        phi_err = float(r.get("phi_err", r.get("孔隙度相对误差", 0.20)))
+        c_err = float(r.get("c_err", r.get("品位相对误差", 0.15)))
+        
+        phi_samples = np.random.triangular(phi * (1 - phi_err), phi, phi * (1 + phi_err), n_sim)
+        c_samples = np.random.triangular(C * (1 - c_err), C, C * (1 + c_err), n_sim)
+        
+        if "非油气" in res["储层类型"]:
+            q_samples = (phi_samples * V_m3) + (S * elastic_head * A_m2)
+        else:
+            if has_seismic_vol:
+                q_samples = (V_m3 * phi_samples * Sw) / Bw
+            else:
+                q_samples = (A_m2 * h * phi_samples * Sw) / Bw
+                
+        p_samples = (q_samples * c_samples * alpha) / 1e4 # 万吨
+        mc_results = {
+            "P90(万吨)": round(float(np.percentile(p_samples, 10)), 2),
+            "P50(万吨)": round(float(np.percentile(p_samples, 50)), 2),
+            "P10(万吨)": round(float(np.percentile(p_samples, 90)), 2),
+            "samples": p_samples
+        }
+        res["P90保守储量(万吨)"] = mc_results["P90(万吨)"]
+        res["P50中值储量(万吨)"] = mc_results["P50(万吨)"]
+        res["P10乐观储量(万吨)"] = mc_results["P10(万吨)"]
+        
+    return res, mc_results
 
 # --------------------------------------------------
-# 3. 侧边栏：专题选择与 5000 万吨目标追踪看板
+# 页面布局与侧边栏
 # --------------------------------------------------
 with st.sidebar:
-    st.title("🧂 深层卤水钾盐评价")
-    st.caption("四川盆地深层钾盐资源动-静综合评价系统")
-    st.markdown("---")
-
-    st.subheader("📍 专题与构造单元设置")
-    region_choice = st.selectbox(
-        "当前录入专题区块",
-        ["川中专题", "川西专题", "川东北专题", "川南专题"]
-    )
-
-    st.markdown("---")
-    st.subheader("🎯 5000万吨新增增储目标追踪")
-
-    # 动态汇总各构造带核定储量
-    total_added_kcl = sum([z["P_final"] for z in st.session_state.zones_data])
-    progress_pct = min(100.0, (total_added_kcl / TARGET_KCL_TONS) * 100) if TARGET_KCL_TONS > 0 else 0.0
-
+    st.title("🧂 增储总目标监控台")
+    st.caption("四川盆地深层富钾卤水重点研发专项")
+    
+    # 实时汇总
+    current_total_kcl = sum([item["P_final_raw"] for item in st.session_state.stored_evaluations])
+    progress = min(1.0, current_total_kcl / TARGET_KCL_TONS)
+    
     st.metric(
-        label="全盆地累计核定 KCl 储量",
-        value=f"{total_added_kcl / 1e4:,.2f} 万吨",
-        delta=f"距目标尚差: {(TARGET_KCL_TONS - total_added_kcl)/1e4:,.2f} 万吨" if total_added_kcl < TARGET_KCL_TONS else "🎉 已圆满达成增储目标！"
+        label="已核算 KCl 总储存量",
+        value=f"{current_total_kcl / 1e4:,.2f} 万吨",
+        delta=f"距离5000万吨还差: {(TARGET_KCL_TONS - current_total_kcl)/1e4:,.2f} 万吨" if current_total_kcl < TARGET_KCL_TONS else "🎉 已圆满达成增储目标！"
     )
-    st.progress(progress_pct / 100.0)
-    st.caption(f"整体推进进度：**{progress_pct:.2f}%** / 100.00%")
-
+    st.progress(progress)
+    st.caption(f"当前整体目标达成度：{progress * 100:.2f}%")
+    
     st.markdown("---")
-    st.write(f"📁 已录入构造带数：**{len(st.session_state.zones_data)}** 个")
-    if st.button("🗑️ 清空所有已保存数据", use_container_width=True):
-        st.session_state.zones_data = []
+    st.write("### 🧭 自适应计算机制说明")
+    st.info(
+        "系统具备**自动降级与升级计算能力**：\n"
+        "- 传入基础参数 \(\\rightarrow\) 运行容积法；\n"
+        "- 包含地震雕刻 \(V\) \(\\rightarrow\) 自动替代平面 \(A \\times h\)；\n"
+        "- 包含试采压降数据 \(\\rightarrow\) 自动执行动静结合修正；\n"
+        "- 任意数据均可自适应生成蒙特卡洛 P10/P50/P90 区间。"
+    )
+    if st.button("🗑️ 清空所有已存成果", use_container_width=True):
+        st.session_state.stored_evaluations = []
         st.rerun()
 
 # --------------------------------------------------
-# 4. 主界面 Tabs：计算工作台、详细操作说明书、总账报表
+# 主界面 Tabs
 # --------------------------------------------------
-tab_calc, tab_docs, tab_summary = st.tabs([
-    "📊 储量动态核算工作台",
-    "📖 详细操作说明书与规范指南",
-    "📋 四大专题总账与成果汇总"
+tab_upload, tab_single, tab_manual, tab_summary = st.tabs([
+    "📁 任意数据批量上传自适应计算",
+    "✍️ 单构造带灵活交互测算",
+    "📖 参数规范与操作说明书",
+    "📊 四大专题总账与成果对比"
 ])
 
-# ==================================================
-# TAB 1: 详细操作说明书与规范指南
-# ==================================================
-with tab_docs:
+# --------------------------------------------------
+# TAB 1: 批量数据上传计算
+# --------------------------------------------------
+with tab_upload:
+    st.subheader("批量上传任意格式数据文件 (CSV / Excel)")
     st.markdown("""
-    ## 深层卤水钾盐动-静结合综合评价系统操作指南
-
-    本系统面向四川盆地深层富钾卤水勘查专题（川中、川西、川东北、川南四大专题组）开发，旨在提供标准化的储量测算规范与动-静校准工作流，为全盆地实现新增 **5000 万吨 KCl** 储量目标提供统一的计算与成果管理平台。
-
-    ---
-
-    ### 一、 静态容积法数学模型
-
-    #### 1. 油气同层型卤水（油气伴生卤水构造）
-    适用于储卤层中油/气与富钾卤水伴生共存的层系：
-    $$
-    Q_w = \\frac{A_w \\cdot h \\cdot \\phi \\cdot S_w}{B_w}
-    $$
-    $$
-    P_A = Q_w \\cdot C
-    $$
-    * $Q_w$：卤水储存量（$\\text{m}^3$）
-    * $A_w$：含卤水面积（$\\text{m}^2$）
-    * $h$：储卤层有效厚度（$\\text{m}$）
-    * $\\phi$：储卤层有效孔隙度（小数）
-    * $S_w$：含水饱和度（小数）
-    * $B_w$：卤水地层体积系数（无因次，通常取 $1.01 \\sim 1.06$）
-    * $C$：氯化钾（$\\text{KCl}$）平均品位（$\\text{t/m}^3$）
-    * $P_A$：卤水盐分（$\\text{KCl}$）储存量（$\\text{t}$）
-
-    #### 2. 非油气同层型卤水（纯承压含水层构造）
-    适用于非油气伴生的深部承压储水层系，综合考虑孔隙储水与顶板承压弹性压释储水：
-    $$
-    Q_{ws} = \\phi \\cdot V + S \\cdot (h - H) \\cdot A
-    $$
-    $$
-    P_A = Q_{ws} \\cdot C
-    $$
-    * $Q_{ws}$：卤水储存量（$\\text{m}^3$）
-    * $\\phi$：储卤层岩石孔隙率（小数）
-    * $V$：储卤层体积（$\\text{m}^3$）。资料丰富阶段若已通过叠前地震多属性反演精细雕刻出空间几何体，可直接采用体雕刻值 $V$；常规情况下按 $V = A \\cdot h$ 估算。
-    * $S$：卤水层的弹性储水系数（在数值上等同于弹性给水度，无因次）
-    * $h$：平均承压水头标高（$\\text{m}$）
-    * $H$：平均储卤层顶面标高（$\\text{m}$），其中 $(h - H)$ 代表净弹性承压水头高度。
-    * $A$：储卤层平面面积（$\\text{m}^2$）
-    * $C$：盐分（$\\text{KCl}$）平均品位（$\\text{t/m}^3$）
-    * $P_A$：卤水盐分储存量（$\\text{t}$）
-
-    ---
-
-    ### 二、 资料丰富度分级评估工作流
-
-    根据地质勘探资料完备程度，系统提供三级评价路径：
-
-    1. **资料匮乏阶段（勘探早期/外围区）**
-       * **地质条件**：仅有少量区域探井，缺乏三维地震精细解释，无长期试水试采压降监测。
-       * **评价路径**：直接采用**确定性静态容积法**，利用统计平均值快速锁定储量基准。
-
-    2. **资料中等阶段（勘探中期/评价区）**
-       * **地质条件**：具备二维/三维构造解释图，有多口井测井解释与卤水化验品位。
-       * **评价路径**：**容积法 + 蒙特卡洛随机模拟**。对孔隙度、品位等关键不确定性参数进行概率抽样，评估 P90（保守）、P50（适中）、P10（乐观）储量区间。
-
-    3. **资料丰富阶段（开发准备期/试采示范区）**
-       * **地质条件**：具备叠前三维地震储层体精细雕刻结果，且具备单井或井组长期试采折算压降曲线。
-       * **评价路径**：**精细雕刻容积法 $\\rightarrow$ 蒙特卡洛模拟 $\\rightarrow$ 动态试采压降与物质平衡校正**。
-
-    ---
-
-    ### 三、 动-静结合物质平衡约束算法
-    静态容积法给出的是地质孔隙总容纳空间，实际开发受制于断层断块遮挡、裂缝连通性及非均质性。在深层封闭卤水储层中，基于弹性压释物质平衡方程求取动态有效控水体积：
-    $$
-    Q_{dyn} = \\frac{W_p}{c_t \\cdot \\Delta p}
-    $$
-    * $W_p$：试采阶段累计排卤出水量（$\\text{m}^3$）
-    * $c_t$：储层综合压缩系数（$\\text{MPa}^{-1}$，包含岩石骨架压缩与水体压缩系数之和）
-    * $\\Delta p$：储层对应折算地层静态压力降（$\\text{MPa}$）
-
-    系统据此构建**动-静连通有效性系数** $\\alpha = \\min\\left(1.0, \\frac{Q_{dyn}}{Q_{stat}}\\right)$，科学校正静态储量，防止开发潜力被盲目虚高估算。
+    各专题（川中、川西、川东北、川南）可直接将已有报表上传。**表头无需完全一致**，系统内置多别名模糊匹配（如“面积/A/Aw”、“品位/C/KCl浓度”等）。缺少某些参数时自动进行保底计算。
     """)
-
-# ==================================================
-# TAB 2: 储量动态核算工作台
-# ==================================================
-with tab_calc:
-    st.subheader(f"🛠️ 构造带评价与计算 —— 【{region_choice}】")
-
-    # 1. 元数据设置
-    meta_col1, meta_col2, meta_col3 = st.columns(3)
-    with meta_col1:
-        zone_name = st.text_input("构造带/圈闭名称", value=f"{region_choice.replace('专题','')}某重点构造T63层")
-    with meta_col2:
-        res_type = st.selectbox("储卤层赋存类型", ["油气同层型", "非油气同层型"])
-    with meta_col3:
-        richness_level = st.select_slider(
-            "数据资料丰富度阶段",
-            options=[
-                "资料匮乏（仅确定性容积法）",
-                "资料中等（容积法 + 蒙特卡洛）",
-                "资料丰富（精细雕刻 + 蒙特卡洛 + 动态约束）"
-            ],
-            value="资料丰富（精细雕刻 + 蒙特卡洛 + 动态约束）"
-        )
-
-    st.markdown("---")
-    st.markdown("#### 第一阶段：静态容积法参数录入与基准核算")
-
-    # 品位输入（公共参数）
-    c_col, note_col = st.columns([1, 2])
-    with c_col:
-        grade_C = st.number_input(
-            "KCl 平均品位 C (t/m³)",
-            value=0.0180,
-            step=0.0010,
-            format="%.4f",
-            help="1 g/L = 1 kg/m³ = 0.001 t/m³。例如 18 g/L 应输入 0.0180 t/m³"
-        )
-    with note_col:
-        st.info("📌 **品位换算提示**：地下卤水常规分析多以 $\\text{g/L}$ 标注，录入时须转换为 $\\text{t/m}^3$（如 $18.5\\text{ g/L} \\rightarrow 0.0185\\text{ t/m}^3$）。")
-
-    # 根据油气同层与非油气同层进行模型参数录入与计算
-    if res_type == "油气同层型":
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1:
-            area_km2 = st.number_input("含卤水面积 Aw (km²)", value=45.0, step=1.0)
-            area_m2 = area_km2 * 1e6
-        with c2:
-            thick_h = st.number_input("储卤层有效厚度 h (m)", value=30.0, step=1.0)
-        with c3:
-            phi = st.number_input("有效孔隙度 ϕ (小数)", value=0.075, min_value=0.001, max_value=0.40, step=0.005, format="%.3f")
-        with c4:
-            sw = st.number_input("含水饱和度 Sw (小数)", value=0.60, min_value=0.01, max_value=1.00, step=0.05)
-        with c5:
-            bw = st.number_input("卤水地层体积系数 Bw", value=1.025, min_value=0.90, max_value=1.50, step=0.005, format="%.3f")
-
-        # 油气同层型计算：Qw = (Aw * h * phi * Sw) / Bw; P = Qw * C
-        Q_static = (area_m2 * thick_h * phi * sw) / bw
-        P_static = Q_static * grade_C
-
-    else:
-        # 非油气同层型
-        c1, c2, c3, c4 = st.columns(4)
-        seismic_carved = False
-
-        if "精细雕刻" in richness_level:
-            seismic_carved = st.checkbox("已通过三维地震多属性反演精细雕刻储层体 (直接录入储层体积 V)", value=True)
-
-        with c1:
-            area_km2 = st.number_input("储卤层平面面积 A (km²)", value=60.0, step=1.0)
-            area_m2 = area_km2 * 1e6
-
-        with c2:
-            if seismic_carved:
-                vol_million_m3 = st.number_input("精细雕刻储层总体积 V (10⁶ m³)", value=1800.0, step=50.0)
-                vol_V_m3 = vol_million_m3 * 1e6
-            else:
-                thick_pure_h = st.number_input("储卤层有效厚度 h (m)", value=35.0, step=1.0)
-                vol_V_m3 = area_m2 * thick_pure_h
-
-        with c3:
-            phi = st.number_input("岩石孔隙率 φ (小数)", value=0.068, min_value=0.001, max_value=0.40, step=0.005, format="%.3f")
-        with c4:
-            storage_S = st.number_input("弹性储水系数/给水度 S", value=0.00045, step=0.00005, format="%.5f")
-
-        c5, c6, _ = st.columns([1, 1, 2])
-        with c5:
-            head_h = st.number_input("平均承压水头标高 h (m)", value=400.0, step=10.0)
-        with c6:
-            top_H = st.number_input("平均储卤层顶面标高 H (m)", value=-2300.0, step=50.0)
-
-        # 非油气同层型计算：Qws = phi * V + S * (h - H) * A; P = Qws * C
-        head_diff = max(0.0, head_h - top_H)
-        Q_static = (phi * vol_V_m3) + (storage_S * head_diff * area_m2)
-        P_static = Q_static * grade_C
-
-    st.success(
-        f"✅ **基础容积法确定性基准结果**：卤水总储存量 $Q$ = **{Q_static/1e8:.4f}** 亿立方米 | "
-        f"KCl 静态资源量 $P_A$ = **{P_static/1e4:,.2f}** 万吨"
-    )
-
-    # --------------------------------------------------
-    # 第二阶段：蒙特卡洛随机模拟
-    # --------------------------------------------------
-    mc_executed = False
-    p50_kcl = P_static
-    p_sim_results = None
-
-    if "蒙特卡洛" in richness_level:
-        st.markdown("---")
-        st.markdown("#### 第二阶段：蒙特卡洛随机模拟（参数不确定性分析）")
-
-        with st.expander("🎲 展开蒙特卡洛概率模拟控制面板", expanded=True):
-            mc1, mc2, mc3 = st.columns(3)
-            with mc1:
-                n_sim = st.select_slider("随机抽样模拟次数", options=[1000, 5000, 10000, 20000], value=10000)
-            with mc2:
-                phi_fluct = st.slider("孔隙度相对波动范围 (±%)", 5, 50, 20)
-            with mc3:
-                grade_fluct = st.slider("品位 C 相对波动范围 (±%)", 5, 50, 15)
-
-            if st.button("▶️ 运行蒙特卡洛概率模拟", type="primary"):
-                mc_executed = True
-                np.random.seed(2026)
-
-                # 品位三角分布抽样
-                c_samples = np.random.triangular(
-                    grade_C * (1 - grade_fluct / 100),
-                    grade_C,
-                    grade_C * (1 + grade_fluct / 100),
-                    n_sim
-                )
-
-                # 孔隙度三角分布抽样
-                phi_samples = np.random.triangular(
-                    phi * (1 - phi_fluct / 100),
-                    phi,
-                    phi * (1 + phi_fluct / 100),
-                    n_sim
-                )
-
-                if res_type == "油气同层型":
-                    sw_samples = np.random.normal(sw, sw * 0.05, n_sim)
-                    sw_samples = np.clip(sw_samples, 0.01, 1.0)
-                    q_samples = (area_m2 * thick_h * phi_samples * sw_samples) / bw
-                else:
-                    q_samples = (phi_samples * vol_V_m3) + (storage_S * head_diff * area_m2)
-
-                p_sim_results = (q_samples * c_samples) / 1e4  # 转换为万吨
-
-                p90_val = np.percentile(p_sim_results, 10)  # 保守
-                p50_val = np.percentile(p_sim_results, 50)  # 中值期望
-                p10_val = np.percentile(p_sim_results, 90)  # 乐观
-                p50_kcl = p50_val * 1e4
-
-                col_mc_fig, col_mc_stat = st.columns([3, 1])
-                with col_mc_fig:
-                    fig_mc = px.histogram(
-                        x=p_sim_results,
-                        nbins=50,
-                        marginal="box",
-                        labels={"x": "KCl 储量 (万吨)"},
-                        title=f"{zone_name} - 蒙特卡洛资源量累积频率与不确定性概率分布",
-                        color_discrete_sequence=["#1f77b4"]
-                    )
-                    fig_mc.add_vline(x=p90_val, line_dash="dash", line_color="#ff7f0e", annotation_text=f"P90: {p90_val:.1f}万吨")
-                    fig_mc.add_vline(x=p50_val, line_dash="solid", line_color="#2ca02c", annotation_text=f"P50: {p50_val:.1f}万吨")
-                    fig_mc.add_vline(x=p10_val, line_dash="dash", line_color="#d62728", annotation_text=f"P10: {p10_val:.1f}万吨")
-                    fig_mc.update_layout(margin=dict(l=20, r=20, t=40, b=20), height=350)
-                    st.plotly_chart(fig_mc, use_container_width=True)
-
-                with col_mc_stat:
-                    st.markdown("##### 概率储量估算")
-                    st.metric("P90 (保守型)", f"{p90_val:,.1f} 万吨")
-                    st.metric("P50 (中值期望)", f"{p50_val:,.1f} 万吨")
-                    st.metric("P10 (乐观型)", f"{p10_val:,.1f} 万吨")
-
-    # --------------------------------------------------
-    # 第三阶段：动态压降与物质平衡约束
-    # --------------------------------------------------
-    final_q = Q_static
-    final_p = p50_kcl if mc_executed else P_static
-    is_dynamic_applied = False
-
-    if "动态约束" in richness_level:
-        st.markdown("---")
-        st.markdown("#### 第三阶段：动态试采压降与物质平衡约束校正")
-
-        with st.expander("📉 试采压降动态拟合约束面板", expanded=True):
-            d1, d2, d3 = st.columns(3)
-            with d1:
-                wp = st.number_input("试采阶段累计排卤出水量 Wp (m³)", value=42000.0, step=2000.0)
-            with d2:
-                delta_p = st.number_input("储层对应折算总压降 Δp (MPa)", value=3.5, min_value=0.01, step=0.1)
-            with d3:
-                ct_input = st.number_input("地层综合压缩系数 Ct (10⁻⁴ MPa⁻¹)", value=8.0, step=0.5)
-                ct = ct_input * 1e-4
-
-            # 弹性压释控水体积
-            Q_dyn = wp / (ct * delta_p)
-
-            dc1, dc2 = st.columns([2, 2])
-            with dc1:
-                st.write(f"📊 **试采压力反映之动态有效控水体积 ($Q_{{dyn}}$)**：**{Q_dyn / 1e8:.4f}** 亿立方米")
-            with dc2:
-                apply_dyn = st.checkbox("确认应用动-静连通有效度系数校正容积法储量", value=True)
-
-            if apply_dyn:
-                is_dynamic_applied = True
-                alpha = min(1.0, max(0.05, Q_dyn / Q_static))
-                st.info(f"🔗 **动-静连通有效度系数 ($\\alpha = Q_{{dyn}} / Q_{{stat}}$)** 评估为：**{alpha:.3f}** (折算连通率约 {alpha*100:.1f}%)")
-                final_q = Q_static * alpha
-                final_p = final_p * alpha
-
-    # --------------------------------------------------
-    # 第四阶段：成果核定与录入总账
-    # --------------------------------------------------
-    st.markdown("---")
-    st.markdown("#### 第四阶段：构造带最终储量核定与录入总账")
-
-    r1, r2, r3 = st.columns([2, 2, 1])
-    with r1:
-        st.metric(
-            label="最终核定卤水体积 (Q)",
-            value=f"{final_q / 1e8:.4f} 亿 m³",
-            delta="动态折减校正" if is_dynamic_applied else "静态容积基准"
-        )
-    with r2:
-        st.metric(
-            label="最终核定 KCl 储量 (P)",
-            value=f"{final_p / 1e4:,.2f} 万吨",
-            delta=f"占 5000万吨总目标的 {(final_p / TARGET_KCL_TONS) * 100:.2f}%"
-        )
-    with r3:
-        if st.button("💾 确认并录入此构造带", type="primary", use_container_width=True):
-            st.session_state.zones_data.append({
-                "区块": region_choice,
-                "构造带名称": zone_name,
-                "储层类型": res_type,
-                "资料完备度": richness_level,
-                "KCl品位(t/m³)": grade_C,
-                "卤水储存量(亿m³)": round(final_q / 1e8, 4),
-                "KCl储存量(万吨)": round(final_p / 1e4, 2),
-                "动态校正": "是" if is_dynamic_applied else "否",
-                "P_final": final_p
-            })
-            st.toast(f"✅ 成功录入：{region_choice} - {zone_name}！")
-            st.rerun()
-
-# ==================================================
-# TAB 3: 四大专题总账与成果汇总
-# ==================================================
-with tab_summary:
-    st.subheader("📋 四川盆地深层卤水钾盐储量综合核算总台账")
-
-    if len(st.session_state.zones_data) == 0:
-        st.info("💡 当前总账为空。请先在【储量动态核算工作台】中完成参数测算并点击【确认并录入此构造带】。")
-    else:
-        df_all = pd.DataFrame(st.session_state.zones_data)
-
-        # 展示明细数据表
-        st.dataframe(df_all.drop(columns=["P_final"]), use_container_width=True)
-
-        st.markdown("---")
-        # 统计图表展示
-        chart_col1, chart_col2 = st.columns(2)
-
-        with chart_col1:
-            region_group = df_all.groupby("区块")["KCl储存量(万吨)"].sum().reset_index()
-            fig_bar = px.bar(
-                region_group,
-                x="区块",
-                y="KCl储存量(万吨)",
-                color="区块",
-                text="KCl储存量(万吨)",
-                title="各专题区块 KCl 累计核定储存量 (万吨)",
-                color_discrete_sequence=px.colors.qualitative.Safe
-            )
-            fig_bar.update_traces(textposition="outside")
-            fig_bar.update_layout(height=400)
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-        with chart_col2:
-            fig_pie = px.pie(
-                df_all,
-                names="区块",
-                values="KCl储存量(万吨)",
-                title="四大专题储量贡献占比",
-                hole=0.45,
-                color_discrete_sequence=px.colors.qualitative.Pastel
-            )
-            fig_pie.update_layout(height=400)
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-        # 报表导出功能
-        csv_file = df_all.drop(columns=["P_final"]).to_csv(index=False).encode("utf_8_sig")
+    
+    # 示例模板下载
+    col_dl1, col_dl2 = st.columns([1, 3])
+    with col_dl1:
+        sample_df = pd.DataFrame([
+            {"构造带": "广安东翼T63", "区块": "川中专题", "储层类型": "油气同层型", "A": 45, "h": 25, "phi": 0.08, "Sw": 0.65, "Bw": 1.02, "C": 0.018, "Wp": 35000, "dp": 3.2, "ct": 8.5},
+            {"构造带": "川西深层断褶带", "区块": "川西专题", "储层类型": "非油气同层型", "A": 60, "V": 1500, "phi": 0.065, "S": 0.0004, "承压水头标高": 300, "储层顶面标高": -2500, "C": 0.021},
+            {"构造带": "川东北平落坝", "区块": "川东北专题", "储层类型": "油气同层型", "A": 30, "h": 18, "phi": 0.07, "C": 0.015}
+        ])
+        csv_buffer = io.BytesIO()
+        sample_df.to_csv(csv_buffer, index=False, encoding="utf_8_sig")
         st.download_button(
-            label="📥 导出全套成果核算报表 (CSV 格式)",
-            data=csv_file,
-            file_name="四川盆地深层卤水钾盐储量动静结合评价总账.csv",
-            mime="text/csv",
-            type="primary"
+            label="📥 下载多类型通用测试模板 (CSV)",
+            data=csv_buffer.getvalue(),
+            file_name="深层卤水储量计算任意数据模板.csv",
+            mime="text/csv"
         )
+
+    uploaded_file = st.file_uploader("选择要计算的数据文件", type=["csv", "xlsx", "xls"])
+    
+    if uploaded_file is not None:
+        try:
+            if uploaded_file.name.endswith(".csv"):
+                df_input = pd.read_csv(uploaded_file)
+            else:
+                df_input = pd.read_excel(uploaded_file)
+                
+            st.write("📋 **已成功解析上传数据预览：**")
+            st.dataframe(df_input.head(5), use_container_width=True)
+            
+            if st.button("⚡ 一键自适应智能核算全表", type="primary"):
+                batch_results = []
+                for idx, row in df_input.iterrows():
+                    calc_res, _ = evaluate_brine_record(row.to_dict(), run_mc=True, n_sim=2000)
+                    batch_results.append(calc_res)
+                    st.session_state.stored_evaluations.append(calc_res)
+                    
+                st.success(f"已完成全表 {len(batch_results)} 个构造带的自适应核算，并已合并至全盆地总账！")
+                df_batch_show = pd.DataFrame(batch_results).drop(columns=["P_final_raw"])
+                st.dataframe(df_batch_show, use_container_width=True)
+        except Exception as e:
+            st.error(f"文件解析或计算时发生错误: {str(e)}")
+
+# --------------------------------------------------
+# TAB 2: 单构造带手动输入测算
+# --------------------------------------------------
+with tab_single:
+    st.subheader("单构造带参数灵活输入（未填项系统自动平滑过渡）")
+    
+    c_m1, c_m2, c_m3 = st.columns(3)
+    with c_m1:
+        s_zone = st.text_input("构造带名称", value="自贡某富钾储卤层")
+    with c_m2:
+        s_region = st.selectbox("归属专题区块", ["川中专题", "川西专题", "川东北专题", "川南专题"])
+    with c_m3:
+        s_type = st.radio("储层赋存类型", ["油气同层型", "非油气同层型"], horizontal=True)
+
+    st.markdown("##### 1. 必填/通用几何与物性参数")
+    cg1, cg2, cg3, cg4 = st.columns(4)
+    with cg1:
+        s_C = st.number_input("KCl 平均品位 C (t/m³)", value=0.0190, step=0.0010, format="%.4f")
+    with cg2:
+        s_A = st.number_input("含水面积 A (km²)", value=50.0, step=1.0)
+    with cg3:
+        s_phi = st.number_input("有效孔隙度 ϕ (小数)", value=0.075, step=0.005, format="%.3f")
+    with cg4:
+        use_seismic = st.checkbox("已有三维地震精细雕刻体积 V", value=False)
+        if use_seismic:
+            s_V = st.number_input("雕刻体积 V (10⁶ m³)", value=1200.0, step=50.0)
+            s_h = 0.0
+        else:
+            s_h = st.number_input("储层有效厚度 h (m)", value=24.0, step=1.0)
+            s_V = None
+
+    if s_type == "油气同层型":
+        st.markdown("##### 2. 油气同层专用参数")
+        co1, co2 = st.columns(2)
+        with co1:
+            s_sw = st.number_input("含水饱和度 Sw (小数)", value=0.60, step=0.05)
+        with co2:
+            s_bw = st.number_input("卤水体积系数 Bw (无因次)", value=1.02, step=0.01)
+        s_S, s_head, s_top = None, None, None
+    else:
+        st.markdown("##### 2. 非油气同层承压水参数")
+        cn1, cn2, cn3 = st.columns(3)
+        with cn1:
+            s_S = st.number_input("弹性储水系数 S", value=0.0005, step=0.0001, format="%.5f")
+        with cn2:
+            s_head = st.number_input("平均承压水头标高 h (m)", value=320.0, step=10.0)
+        with cn3:
+            s_top = st.number_input("平均储层顶面标高 H (m)", value=-2100.0, step=50.0)
+        s_sw, s_bw = None, None
+
+    st.markdown("##### 3. 动态约束参数（可选，留空则仅计算静态）")
+    has_dyn_input = st.checkbox("输入试采压降数据进行动静结合约束", value=False)
+    if has_dyn_input:
+        cd1, cd2, cd3 = st.columns(3)
+        with cd1:
+            s_wp = st.number_input("试采累计排卤量 Wp (m³)", value=28000.0, step=1000.0)
+        with cd2:
+            s_dp = st.number_input("生产折算压降 Δp (MPa)", value=2.8, step=0.1)
+        with cd3:
+            s_ct = st.number_input("综合压缩系数 Ct (10⁻⁴ MPa⁻¹)", value=8.0, step=0.5)
+    else:
+        s_wp, s_dp, s_ct = None, None, None
+
+    if st.button("🚀 计算本构造带并生成不确定性分析", type="primary"):
+        input_dict = {
+            "构造带": s_zone, "区块": s_region, "储层类型": s_type,
+            "C": s_C, "A": s_A, "phi": s_phi, "h": s_h,
+            "Sw": s_sw, "Bw": s_bw, "S": s_S, "承压水头标高": s_head, "储层顶面标高": s_top,
+            "Wp": s_wp, "dp": s_dp, "ct": s_ct
+        }
+        if s_V is not None:
+            input_dict["V"] = s_V
+            
+        res_calc, mc_res = evaluate_brine_record(input_dict, run_mc=True, n_sim=5000)
+        
+        # 结果指标展示
+        r_c1, r_c2, r_c3, r_c4 = st.columns(4)
+        r_c1.metric("建模模式", res_calc["几何建模方式"])
+        r_c2.metric("动态约束", res_calc["动态约束状态"])
+        r_c3.metric("核定卤水量", f"{res_calc['最终核定卤水体积(亿m³)']:.4f} 亿m³")
+        r_c4.metric("核定 KCl 储量", f"{res_calc['最终核定KCl储量(万吨)']:,.2f} 万吨")
+        
+        # 蒙特卡洛直方图
+        if mc_res:
+            fig_hist = px.histogram(
+                x=mc_res["samples"], nbins=50,
+                labels={"x": "KCl 储量 (万吨)"},
+                title="蒙特卡洛不确定性模拟概率分布 (P10 - P50 - P90)"
+            )
+            fig_hist.add_vline(x=mc_res["P90(万吨)"], line_dash="dash", line_color="orange", annotation_text=f"P90: {mc_res['P90(万吨)']}万吨")
+            fig_hist.add_vline(x=mc_res["P50(万吨)"], line_dash="solid", line_color="green", annotation_text=f"P50: {mc_res['P50(万吨)']}万吨")
+            fig_hist.add_vline(x=mc_res["P10(万吨)"], line_dash="dash", line_color="red", annotation_text=f"P10: {mc_res['P10(万吨)']}万吨")
+            st.plotly_chart(fig_hist, use_container_width=True)
+            
+        if st.button("💾 确认录入该结果到成果总账"):
+            st.session_state.stored_evaluations.append(res_calc)
+            st.success(f"已录入 {s_zone}，请前往“四大专题总账”查看！")
+
+# --------------------------------------------------
+# TAB 3: 详细操作说明书与规范
+# --------------------------------------------------
+with tab_manual:
+    st.markdown("""
+    ## 深层卤水钾盐资源动-静综合评价操作手册与自适应规则
+
+    ### 1. 计算公式标准
+
+    #### (1) 油气同层型卤水
