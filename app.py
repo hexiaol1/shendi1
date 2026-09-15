@@ -24,18 +24,13 @@ if "stored_evaluations" not in st.session_state:
 # 核心自适应计算引擎
 # --------------------------------------------------
 def evaluate_brine_record(row_data, run_mc=True, n_sim=5000):
-    """
-    根据行数据中提供的有效字段，自适应决策计算链路：
-    容积法(油气同层/非油气同层) -> 蒙特卡洛不确定性模拟 -> 动态压降约束
-    """
     res = {}
-    r = {k.strip(): v for k, v in row_data.items() if pd.notna(v)}
+    r = {str(k).strip(): v for k, v in row_data.items() if pd.notna(v)}
     
     res["构造带"] = str(r.get("构造带", r.get("构造名称", "未命名构造")))
     res["区块"] = str(r.get("区块", r.get("专题", "川中专题")))
     res["储层类型"] = str(r.get("储层类型", r.get("类型", "油气同层型"))).strip()
     
-    # 基础参数提取 (带默认单位换算与容错)
     # 品位 C (t/m3)
     C = float(r.get("C", r.get("KCl品位", r.get("品位", 0.018))))
     res["KCl品位(t/m³)"] = C
@@ -56,7 +51,6 @@ def evaluate_brine_record(row_data, run_mc=True, n_sim=5000):
     has_seismic_vol = ("V" in r) or ("雕刻体积" in r) or ("储层体积" in r)
     if has_seismic_vol:
         V_raw = float(r.get("V", r.get("雕刻体积", r.get("储层体积", 0.0))))
-        # 兼容单位：如果输入值 < 10000，通常用户是以 百万方(10^6 m3) 录入
         V_m3 = V_raw * 1e6 if V_raw < 1e5 else V_raw
         res["几何建模方式"] = "地震精细三维雕刻体积 V"
     else:
@@ -95,7 +89,7 @@ def evaluate_brine_record(row_data, run_mc=True, n_sim=5000):
         Wp = float(r.get("Wp", r.get("排卤量", r.get("累计产水量", 0.0))))
         dp = float(r.get("dp", r.get("压降", r.get("Δp", 1.0))))
         ct_raw = float(r.get("ct", r.get("Ct", r.get("压缩系数", 8.5))))
-        ct = ct_raw * 1e-4 if ct_raw > 1e-2 else ct_raw  # 兼容量纲
+        ct = ct_raw * 1e-4 if ct_raw > 1e-2 else ct_raw
         
         if dp > 0 and ct > 0:
             Q_dynamic = Wp / (ct * dp)
@@ -118,7 +112,7 @@ def evaluate_brine_record(row_data, run_mc=True, n_sim=5000):
     res["最终核定KCl储量(万吨)"] = round(P_constrained / 1e4, 2)
     res["P_final_raw"] = P_constrained
 
-    # 3. 蒙特卡洛模拟 (根据可用波动字段或默认自适应波动)
+    # 3. 蒙特卡洛模拟
     mc_results = {}
     if run_mc:
         np.random.seed(42)
@@ -136,7 +130,7 @@ def evaluate_brine_record(row_data, run_mc=True, n_sim=5000):
             else:
                 q_samples = (A_m2 * h * phi_samples * Sw) / Bw
                 
-        p_samples = (q_samples * c_samples * alpha) / 1e4 # 万吨
+        p_samples = (q_samples * c_samples * alpha) / 1e4
         mc_results = {
             "P90(万吨)": round(float(np.percentile(p_samples, 10)), 2),
             "P50(万吨)": round(float(np.percentile(p_samples, 50)), 2),
@@ -156,7 +150,6 @@ with st.sidebar:
     st.title("🧂 增储总目标监控台")
     st.caption("四川盆地深层富钾卤水重点研发专项")
     
-    # 实时汇总
     current_total_kcl = sum([item["P_final_raw"] for item in st.session_state.stored_evaluations])
     progress = min(1.0, current_total_kcl / TARGET_KCL_TONS)
     
@@ -171,10 +164,10 @@ with st.sidebar:
     st.markdown("---")
     st.write("### 🧭 自适应计算机制说明")
     st.info(
-        "系统具备**自动降级与升级计算能力**：\n"
-        "- 传入基础参数 \(\\rightarrow\) 运行容积法；\n"
-        "- 包含地震雕刻 \(V\) \(\\rightarrow\) 自动替代平面 \(A \\times h\)；\n"
-        "- 包含试采压降数据 \(\\rightarrow\) 自动执行动静结合修正；\n"
+        "系统具备自动降级与升级计算能力：\n"
+        "- 传入基础参数：自动运行容积法；\n"
+        "- 包含地震雕刻 V：自动替代平面 A × h；\n"
+        "- 包含试采压降数据：自动执行动静结合修正；\n"
         "- 任意数据均可自适应生成蒙特卡洛 P10/P50/P90 区间。"
     )
     if st.button("🗑️ 清空所有已存成果", use_container_width=True):
@@ -196,26 +189,23 @@ tab_upload, tab_single, tab_manual, tab_summary = st.tabs([
 # --------------------------------------------------
 with tab_upload:
     st.subheader("批量上传任意格式数据文件 (CSV / Excel)")
-    st.markdown("""
-    各专题（川中、川西、川东北、川南）可直接将已有报表上传。**表头无需完全一致**，系统内置多别名模糊匹配（如“面积/A/Aw”、“品位/C/KCl浓度”等）。缺少某些参数时自动进行保底计算。
-    """)
+    st.markdown(
+        "各专题（川中、川西、川东北、川南）可直接将已有报表上传。表头无需完全一致，系统内置多别名模糊匹配。缺少某些参数时自动进行保底计算。"
+    )
     
-    # 示例模板下载
-    col_dl1, col_dl2 = st.columns([1, 3])
-    with col_dl1:
-        sample_df = pd.DataFrame([
-            {"构造带": "广安东翼T63", "区块": "川中专题", "储层类型": "油气同层型", "A": 45, "h": 25, "phi": 0.08, "Sw": 0.65, "Bw": 1.02, "C": 0.018, "Wp": 35000, "dp": 3.2, "ct": 8.5},
-            {"构造带": "川西深层断褶带", "区块": "川西专题", "储层类型": "非油气同层型", "A": 60, "V": 1500, "phi": 0.065, "S": 0.0004, "承压水头标高": 300, "储层顶面标高": -2500, "C": 0.021},
-            {"构造带": "川东北平落坝", "区块": "川东北专题", "储层类型": "油气同层型", "A": 30, "h": 18, "phi": 0.07, "C": 0.015}
-        ])
-        csv_buffer = io.BytesIO()
-        sample_df.to_csv(csv_buffer, index=False, encoding="utf_8_sig")
-        st.download_button(
-            label="📥 下载多类型通用测试模板 (CSV)",
-            data=csv_buffer.getvalue(),
-            file_name="深层卤水储量计算任意数据模板.csv",
-            mime="text/csv"
-        )
+    sample_df = pd.DataFrame([
+        {"构造带": "广安东翼T63", "区块": "川中专题", "储层类型": "油气同层型", "A": 45, "h": 25, "phi": 0.08, "Sw": 0.65, "Bw": 1.02, "C": 0.018, "Wp": 35000, "dp": 3.2, "ct": 8.5},
+        {"构造带": "川西深层断褶带", "区块": "川西专题", "储层类型": "非油气同层型", "A": 60, "V": 1500, "phi": 0.065, "S": 0.0004, "承压水头标高": 300, "储层顶面标高": -2500, "C": 0.021},
+        {"构造带": "川东北平落坝", "区块": "川东北专题", "储层类型": "油气同层型", "A": 30, "h": 18, "phi": 0.07, "C": 0.015}
+    ])
+    csv_buffer = io.BytesIO()
+    sample_df.to_csv(csv_buffer, index=False, encoding="utf_8_sig")
+    st.download_button(
+        label="📥 下载多类型通用测试模板 (CSV)",
+        data=csv_buffer.getvalue(),
+        file_name="深层卤水储量计算任意数据模板.csv",
+        mime="text/csv"
+    )
 
     uploaded_file = st.file_uploader("选择要计算的数据文件", type=["csv", "xlsx", "xls"])
     
@@ -250,7 +240,7 @@ with tab_single:
     
     c_m1, c_m2, c_m3 = st.columns(3)
     with c_m1:
-        s_zone = st.text_input("构造带名称", value="自贡某富钾储卤层")
+        s_zone = st.text_input("构造带名称", value="广安构造某富钾储卤层")
     with c_m2:
         s_region = st.selectbox("归属专题区块", ["川中专题", "川西专题", "川东北专题", "川南专题"])
     with c_m3:
@@ -317,14 +307,12 @@ with tab_single:
             
         res_calc, mc_res = evaluate_brine_record(input_dict, run_mc=True, n_sim=5000)
         
-        # 结果指标展示
         r_c1, r_c2, r_c3, r_c4 = st.columns(4)
         r_c1.metric("建模模式", res_calc["几何建模方式"])
         r_c2.metric("动态约束", res_calc["动态约束状态"])
         r_c3.metric("核定卤水量", f"{res_calc['最终核定卤水体积(亿m³)']:.4f} 亿m³")
         r_c4.metric("核定 KCl 储量", f"{res_calc['最终核定KCl储量(万吨)']:,.2f} 万吨")
         
-        # 蒙特卡洛直方图
         if mc_res:
             fig_hist = px.histogram(
                 x=mc_res["samples"], nbins=50,
@@ -341,12 +329,12 @@ with tab_single:
             st.success(f"已录入 {s_zone}，请前往“四大专题总账”查看！")
 
 # --------------------------------------------------
-# TAB 3: 详细操作说明书与规范
+# TAB 3: 详细操作说明书与规范 (使用原始字符串 r""" 避免转义报错)
 # --------------------------------------------------
 with tab_manual:
-    st.markdown("""
-    ## 深层卤水钾盐资源动-静综合评价操作手册与自适应规则
+    st.markdown(r"""
+## 深层卤水钾盐资源动-静综合评价操作手册与自适应规则
 
-    ### 1. 计算公式标准
+### 1. 计算公式标准
 
-    #### (1) 油气同层型卤水
+#### (1) 油气同层型卤水
