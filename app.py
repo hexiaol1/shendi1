@@ -57,7 +57,7 @@ with st.sidebar:
     my_target = TOPIC_TARGETS[active_topic]
     my_records = st.session_state.topic_archives[active_topic]
 
-    my_total_kcl = sum([r["最终核定KCl储量(万吨)"] for r in my_records])
+    my_total_kcl = sum([float(r.get("最终核定KCl储量(万吨)", 0.0)) for r in my_records])
     my_progress = min(1.0, (my_total_kcl * 1e4) / my_target) if my_target > 0 else 0.0
 
     st.markdown("---")
@@ -120,11 +120,6 @@ def generate_parameter_draws(
     n_sim=10000,
     val_type="phi"
 ):
-    """
-    根据选择的蒙特卡洛模式生成抽样序列：
-    - 模式一：多井实测样本拟合
-    - 模式二：单点/少井先验扰动
-    """
     if samples_arr is None:
         samples_arr = np.array([])
     valid_samples = samples_arr[samples_arr > 0]
@@ -132,7 +127,6 @@ def generate_parameter_draws(
     fit_info = {}
 
     if "多井" in mc_mode and len(valid_samples) >= 3:
-        # 模式一：多井统计拟合
         mean_val = float(np.mean(valid_samples))
         std_val = float(np.std(valid_samples, ddof=1))
 
@@ -163,23 +157,20 @@ def generate_parameter_draws(
             "samples": valid_samples,
         }
     else:
-        # 模式二：单点/少井先验扰动（井少或仅有代表值）
         mean_val = valid_samples[0] if len(valid_samples) > 0 else base_val
-        # 三角分布抽样
         low = mean_val * (1.0 - err_ratio)
         high = mean_val * (1.0 + err_ratio)
         draws = np.random.triangular(low, mean_val, high, n_sim)
         fit_info = {
             "mode": "单点/少井先验扰动模式",
             "type": "三角分布 (先验扰动)",
-            "desc": f"先验三角分布(代表值={mean_val:.4f}, 扰动±{err_ratio*100:.0f}%)",
+            "desc": f"先验三角分布(基准={mean_val:.4f}, 扰动±{err_ratio*100:.0f}%)",
             "mean": mean_val,
             "std": float(np.std(draws)),
             "n_samples": len(valid_samples),
             "samples": valid_samples,
         }
 
-    # 物理合理边界截断
     if val_type == "phi":
         draws = np.clip(draws, 0.001, 0.45)
     elif val_type == "C":
@@ -207,7 +198,7 @@ def evaluate_and_archive_unit(
     zone_name = str(r.get("构造带", r.get("构造名称", r.get("计算单元", "未命名单元"))))
     res_type = str(r.get("储层类型", r.get("类型", "油气同层型"))).strip()
 
-    # 1. 基础静态物理参数与多井序列解析
+    # 1. 基础物理量解析
     phi_raw = r.get("多井孔隙度序列", r.get("phi_samples", ""))
     phi_sample_arr = parse_sample_values(phi_raw)
     phi_single = float(r.get("phi", r.get("ϕ", r.get("孔隙度", 0.08))))
@@ -223,7 +214,6 @@ def evaluate_and_archive_unit(
     A_km2 = float(r.get("A", r.get("Aw", r.get("面积", 50.0))))
     A_m2 = A_km2 * 1e6
 
-    # 地震雕刻
     has_seismic_vol = ("V" in r) or ("雕刻体积" in r) or ("储层体积" in r)
     if has_seismic_vol:
         V_raw = float(r.get("V", r.get("雕刻体积", r.get("储层体积", 0.0))))
@@ -241,7 +231,7 @@ def evaluate_and_archive_unit(
     top_H = float(r.get("储层顶面标高", r.get("H_top", -2200.0)))
     elastic_head = max(0.0, head_h - top_H)
 
-    # 2. 蒙特卡洛变量抽样（根据选定模式）
+    # 2. 蒙特卡洛变量抽样
     phi_draws, phi_fit = generate_parameter_draws(
         mc_mode=mc_mode, samples_arr=phi_sample_arr, base_val=phi_single,
         err_ratio=phi_err_manual, dist_type=dist_type, n_sim=n_sim, val_type="phi"
@@ -292,7 +282,7 @@ def evaluate_and_archive_unit(
                 f"由累计排卤 Wp={Wp:.0f}m³、压降 Δp={dp:.2f}MPa 反求动态孔隙；"
                 f"有效孔隙校正系数={calib_phi_factor:.3f}"
             )
-            param_adjust_note = f"静态基准孔隙度由 {phi_mean*100:.2f}% 校准为 {phi_adj*100:.2f}%"
+            param_adjust_note = f"基准孔隙度由 {phi_mean*100:.2f}% 校准为 {phi_adj*100:.2f}%"
 
     elif "方法二" in dyn_choice and has_m2:
         qw = float(r.get("qw", r.get("日产水量", 180.0)))
@@ -306,12 +296,12 @@ def evaluate_and_archive_unit(
             h_adj = h_init * calib_h_factor
             dyn_method_applied = "方法二：渗流压差反演校准有效厚度"
             dyn_process = (
-                f"由日产水 qw={qw:.1f}m³/d、生产压差 Δp={dp_flow:.2f}MPa 反求动态产层厚度；"
+                f"由日产水 qw={qw:.1f}m³/d、生产压差 Δp={dp_flow:.2f}MPa 反求动态厚度；"
                 f"厚度校准系数={calib_h_factor:.3f}"
             )
             param_adjust_note = f"储层厚度由原始解释 {h_init:.2f}m 校准为 {h_adj:.2f}m"
 
-    # 5. 结合校准后状态进行储量蒙特卡洛抽样计算
+    # 5. 结合校准后状态进行蒙特卡洛抽样计算
     phi_draws_adj = phi_draws * calib_phi_factor
     h_draws_adj = h_adj
 
@@ -340,6 +330,7 @@ def evaluate_and_archive_unit(
     p50_val = round(float(np.percentile(P_draws_kcl_wan, 50)), 2)
     p10_val = round(float(np.percentile(P_draws_kcl_wan, 90)), 2)
 
+    # 规范化归档字典，确保所有键完整统一
     record = {
         "计算单元编号": unit_id,
         "计算时间": calc_time,
@@ -396,7 +387,6 @@ with tab_step1:
         "**自适应建模支持**：针对井数多、资料全的成熟区提供**多井概率密度统计拟合**；针对勘探早期、井数少或仅有单点解释的区域提供**先验扰动模式**。"
     )
 
-    # 1. 蒙特卡洛模式全局配置面板
     with st.expander("⚙️ 蒙特卡洛建模模式与不确定性参数配置（点击展开/收起）", expanded=True):
         col_m1, col_m2 = st.columns(2)
         with col_m1:
@@ -574,11 +564,10 @@ with tab_step1:
             r3.metric("最终核定 KCl 储量", f"{cur_rec['最终核定KCl储量(万吨)']:,.2f} 万吨", delta=cur_rec['校准前后储量变化率'])
             r4.metric("核定卤水体积", f"{cur_rec['核定卤水体积(亿m³)']:.4f} 亿m³")
 
-            st.markdown(f"**当前使用的蒙特卡洛模式**：`{cur_rec['蒙特卡洛模式']}` | **孔隙度分布特征**：`{cur_rec['孔隙度分布特征']}`")
+            st.markdown(f"**当前使用的蒙特卡洛模式**：`{cur_rec.get('蒙特卡洛模式', '自适应模式')}` | **分布特征**：`{cur_rec.get('孔隙度分布特征', '标准分布')}`")
 
             plot_c1, plot_c2 = st.columns(2)
             with plot_c1:
-                # 孔隙度抽样直方图
                 phi_samples = cur_art["phi_fit"]["samples"]
                 fig_fit = px.histogram(
                     x=cur_art["phi_draws"] * 100, nbins=50, histnorm='probability density',
@@ -591,7 +580,6 @@ with tab_step1:
                 st.plotly_chart(fig_fit, use_container_width=True)
 
             with plot_c2:
-                # 储量分布图
                 fig_p = px.histogram(
                     x=cur_art["P_draws"], nbins=60,
                     labels={"x": "KCl 储量 (万吨)"},
@@ -603,8 +591,8 @@ with tab_step1:
                 st.plotly_chart(fig_p, use_container_width=True)
 
             with st.expander("🔍 查看本单元参数校准细节与容积法推导过程", expanded=True):
-                st.write(f"**动态校准过程**：{cur_rec['动静推演计算过程']}")
-                st.write(f"**校准后容积法公式**：{cur_rec['校准后容积法推演']}")
+                st.write(f"**动态校准过程**：{cur_rec.get('动静推演计算过程', '无')}")
+                st.write(f"**校准后容积法公式**：{cur_rec.get('校准后容积法推演', '无')}")
 
             col_save1, _ = st.columns([1, 3])
             with col_save1:
@@ -671,7 +659,6 @@ with tab_step1:
                     method_code = "方法一" if "方法一" in batch_dyn_def else "方法二"
                     for _, row in df_raw.iterrows():
                         row_dict = row.to_dict()
-                        # 根据当前行是否有“多井序列”自适应分配模式
                         auto_mode = "多井实测样本拟合模式" if pd.notna(row_dict.get("多井孔隙度序列")) else "单点/少井先验扰动模式"
                         rec, _ = evaluate_and_archive_unit(
                             row_dict,
@@ -692,7 +679,7 @@ with tab_step1:
                 st.error(f"批量推演失败: {str(err)}")
 
 # --------------------------------------------------
-# TAB 2: 第二步 全要素归档总账与详单下载
+# TAB 2: 第二步 全要素归档总账与详单下载（安全切片保护）
 # --------------------------------------------------
 with tab_archive:
     st.subheader(f"第二步：【{active_topic}】计算单元全要素归档详单")
@@ -703,28 +690,41 @@ with tab_archive:
         df_arc = pd.DataFrame(my_records)
         st.write(f"已累计归档 **{len(df_arc)}** 个单元的具体推演履历。")
 
-        core_cols = [
+        # 预设的核心展示列清单
+        preferred_cols = [
             "计算单元编号", "计算时间", "构造带/单元名称", "储层类型", "计算模型",
             "蒙特卡洛模式", "孔隙度分布特征", "动态参数校准说明",
             "原始静态KCl储量(万吨)", "最终核定KCl储量(万吨)", "蒙特卡洛P50(万吨)",
             "校准后容积法推演"
         ]
-        st.dataframe(df_arc[core_cols], use_container_width=True)
+        
+        # 安全取交集，杜绝任何 KeyError 报错
+        valid_cols = [col for col in preferred_cols if col in df_arc.columns]
+        if not valid_cols:
+            valid_cols = list(df_arc.columns)
+            
+        st.dataframe(df_arc[valid_cols], use_container_width=True)
+
+        # 绘制柱状图（带列存在性安全防守）
+        x_col = "构造带/单元名称" if "构造带/单元名称" in df_arc.columns else df_arc.columns[0]
+        y_col = "最终核定KCl储量(万吨)" if "最终核定KCl储量(万吨)" in df_arc.columns else df_arc.columns[1]
+        color_col = "动静结合方法" if "动静结合方法" in df_arc.columns else None
 
         fig_unit_bar = px.bar(
             df_arc,
-            x="构造带/单元名称",
-            y="最终核定KCl储量(万吨)",
-            text="最终核定KCl储量(万吨)",
-            color="动静结合方法",
+            x=x_col,
+            y=y_col,
+            text=y_col,
+            color=color_col,
             title=f"【{active_topic}】各计算单元核定储量 (目标配额: {my_target/1e4:.0f}万吨)",
         )
         fig_unit_bar.update_traces(textposition="outside")
         st.plotly_chart(fig_unit_bar, use_container_width=True)
 
+        # 导出全部字段
         csv_archive_out = df_arc.to_csv(index=False).encode("utf_8_sig")
         st.download_button(
-            label=f"📥 导出【{active_topic}】全要素归档报表 (含双模式蒙特卡洛标记 CSV)",
+            label=f"📥 导出【{active_topic}】全要素归档报表 (CSV)",
             data=csv_archive_out,
             file_name=f"{active_topic}_双模式储量评价归档详单.csv",
             mime="text/csv",
